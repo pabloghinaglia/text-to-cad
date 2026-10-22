@@ -264,6 +264,11 @@ export const STEP_PART_VIEW_FEATURES = Object.freeze({
   settings: Object.freeze(VIEW_SETTING_IDS.filter(id => id !== "exploded"))
 });
 
+/** A cadgen engine document: what a STEP assembly offers (its CAD edges in every mode, Clip, Explode). @type {ViewFeatures} */
+export const XBF_VIEW_FEATURES = ALL_VIEW_FEATURES;
+/** A cadgen engine document of one part: what a STEP part file offers (no Parts, no Explode). @type {ViewFeatures} */
+export const XBF_PART_VIEW_FEATURES = STEP_PART_VIEW_FEATURES;
+
 /**
  * What a file of `kind` offers, for the viewer and a snapshot alike: a STEP everything; any other
  * 3D file (STL, 3MF, GLB, a robot) has no CAD edges, so Solid, and Parts where it has several
@@ -278,6 +283,8 @@ export function viewFeaturesForKind(kind, { parts = 0, explodeParts = 0 } = {}) 
   const normalized = String(kind || "").trim().toLowerCase();
   if (normalized === "step" || normalized === "stp") return ALL_VIEW_FEATURES;
   if (normalized === "dxf") return EDGELESS_VIEW_FEATURES;
+  // A cadgen engine document is offered what a STEP is: an assembly everything, a part no Parts or Explode.
+  if (normalized === "xbf") return parts > 1 ? XBF_VIEW_FEATURES : XBF_PART_VIEW_FEATURES;
   return {
     modes: parts > 1 ? ["solid", "parts"] : ["solid"],
     settings: normalized === "glb" && explodeParts > 1 ? ["clip", "exploded"] : ["clip"]

@@ -18,15 +18,10 @@ family and draws the navbar and the explorer. The catalog exposes CAD
 artifacts only, and the web app has no file-writing endpoints.
 Follow the [shared host contract](../../packages/ui/docs/viewer-host.md) when
 adding viewer features; browser effects belong in this app's adapters.
-The [shared Model tree](../../packages/ui/docs/cad-renderer.md#step-panels)
-owns expansion-based picking, lazy topology/feature inspection and isolation.
+The [shared Model tree](../../packages/ui/docs/cad-renderer.md#engine-document-panels)
+owns expansion-based picking and isolation.
 Web uses the same tree and file-row primitives as desktop; its HTTP adapter
 does not decide which model nodes are expanded or selectable.
-Feature detection runs client-side in shared UI when parts are expanded, with
-a versioned memory cache reused across file switches. A page refresh loses that
-cache; recognition is separate from cadgen compilation and Python inspection.
-See [feature detection](../../packages/ui/docs/feature-detection.md) for rules,
-limits and cancellation. This app supplies resources, not recognition logic.
 
 **May depend on:** compiled `@text-to-cad/ui` and `@text-to-cad/core` exports and app
 libraries. Never another application's source. Shared packages never import
@@ -36,7 +31,7 @@ this app. The Python wheel consumes only the production build.
 src/
   App.tsx               the CadViewer's browser host: URL, history, title, appearance, the file menu and the library
   main.tsx              host/client bootstrap and cleanup
-  host/                 browser clipboard, prompt delivery, the app menu's links and release check, development auto-reload
+  host/                 browser clipboard, prompt delivery, the app menu's links and release check, reload under a new server
   persistence/          the tab record in sessionStorage
   client/               appearance control and styling
   shared/               app build/runtime configuration helpers
@@ -53,16 +48,20 @@ and assets, so the app does not scan another package's source.
 - **One boundary**: the app imports shared packages through public exports.
   The root dependency checker prevents app-to-app and package-to-app imports.
   The backend is not here: its code, its tests and its laws live with cadgen.
-- **Document boundary**: everything renders from the artifact, its optional
-  schema-9 `.step.json` sidecar and immutable cache views. The sidecar embeds
-  appearance, JavaScript animation and kinematics. The viewer never reads model
-  source and never triggers a source build. An already-running build can publish
-  complete immutable preview revisions before saving its STEP output.
-- **Independent motion**: kinematics and animation compose in effect records.
-  Annotation revisions reload without rebuilding geometry. A mismatched STEP
-  digest leaves geometry viewable and reports unavailable annotations.
-- **Loud failure**: a missing entry, an unresolvable ref, or a failed
-  compile surfaces as an alert — never a silently wrong scene.
+- **Document boundary**: everything renders from the file. A STEP and an `.xbf`
+  render from what the cadgen engine serves of them — the structure (names,
+  colours, materials, the mechanism) and one buffer per part, read through the
+  viewer (`/__cad/xbf`, [docs/backend.md](docs/backend.md)) — and every other
+  format from its own bytes or what cadgen resolved from them. The viewer never
+  reads model source and never triggers a source build: a build of a document a
+  view shows reaches it as the engine's next version, at once, and only the parts
+  the edit changed are fetched. A part and an element are named as the engine
+  names them (`f:`/`e:`/`v:` names), never by bytes, ordinals or positions, so a
+  copied ref survives a rebuild.
+- **Independent motion**: a document's mechanism poses its parts in the page
+  (Position); the engine serves the document, never a frame of it.
+- **Loud failure**: a missing entry, an unresolvable ref, or a file the engine
+  cannot read surfaces as an alert — never a silently wrong scene.
 
 ## Launching
 
@@ -85,7 +84,7 @@ without changing that folder. It is only where relative links resolve
 (`serverInfo.start`): the backend opens any file by its absolute path.
 
 Dev spawns the real backend — `python -m cadgen.viewer --new --api-only` on a
-port of its own — and proxies `/__cad` and `/__tess_cache` to it, so there is
+port of its own — and proxies `/__cad` to it, so there is
 one implementation, not two, and Vite owns the client. `VIEWER_PYTHON` names the
 interpreter that has cadgen installed (it defaults to `python3` and must be
 Python 3.11 or newer); `VIEWER_BACKEND_URL` attaches to a backend you started
@@ -147,11 +146,10 @@ detection only; it keeps serving.
 - **Verify a link by loading the page**, never by curling `/__cad/asset` —
   that route serves raw files; generated entries render through a
   different route, so probing it 404s whether or not anything is wrong.
-- **Warm work survives navigation.** The app retains one client across navigation, so its
-  bounded mesh-cache write queue survives file switches. The shared renderer
-  retains completed STEP working sets in a bounded CPU cache, so reopening a
-  warm assembly does not reload each component. Origin and revision identities
-  isolate reuse; changed files and evicted entries load normally.
+- **Warm work survives navigation.** The app retains one client across navigation, so the
+  caches keyed to its resources stay valid across file switches. The cadgen engine holds
+  every document it served, a STEP's read held by its bytes, so reopening one reads and
+  meshes nothing again while its daemon lives.
   Inactive WebGL scenes are released, and a file's view (its camera, Display
   settings and pose) lasts only while it is the file on screen: a refresh brings it
   back, and leaving the file drops it.
@@ -165,7 +163,7 @@ detection only; it keeps serving.
 
 This app exports no components. Other hosts use `@text-to-cad/ui/file-viewer` with
 registered renderers and explicit services. Viewer content is registered through
-`@text-to-cad/ui/renderers/step`, for `.dxf` `@text-to-cad/ui/renderers/dxf`, for `.glb`
+`@text-to-cad/ui/renderers/xbf` for `.step`, `.stp` and `.xbf`, for `.dxf` `@text-to-cad/ui/renderers/dxf`, for `.glb`
 `@text-to-cad/ui/renderers/glb`, for `.stl` and `.3mf` `@text-to-cad/ui/renderers/mesh`, and
 for `.urdf`, `.srdf` and `.sdf` `@text-to-cad/ui/renderers/robot` (`CadViewer` registers all
 five with the same client and preferences, as it does for the MCP app); all loading,
@@ -174,6 +172,12 @@ package. See `docs/shell.md` for the host boundary and `docs/storage.md` for
 browser persistence. CAD control guidance lives with the UI package.
 
 `vite.config.mjs` names the build, for the version the app menu shows (`__TEXT_TO_CAD_BUILD__`,
+from `@text-to-cad/ui/build-id`): none for the release's own build, whose
+environment names its version in `TEXT_TO_CAD_RELEASE` (the release workflow's bundle
+step), so it shows `v0.7.15`; for any other build, `vite dev` included, the commit of
+this checkout, with `-dirty` when it had uncommitted changes: `v0.7.15-dev.b80844940`.
+
+It also names the build, for the version the app menu shows (`__TEXT_TO_CAD_BUILD__`,
 from `@text-to-cad/ui/build-id`): none for the release's own build, whose
 environment names its version in `TEXT_TO_CAD_RELEASE` (the release workflow's bundle
 step), so it shows `v0.7.15`; for any other build, `vite dev` included, the commit of
@@ -248,19 +252,24 @@ another or for the home drops it, and opening it again frames it anew (see
 Authored material information lives in the selection's reference details; editing
 it requires changing the source model or annotations. The viewer has no Materials
 or Theme editor. These controls live in `@text-to-cad/ui`; see the UI package's
-Render and LOD playbooks.
+Render and loading playbooks.
 
-Large assemblies load progressively and refine visible components within memory
-budgets. Warm tessellations can render before exact surface derivation. The
+A STEP or an `.xbf` loads its structure, then its parts, each at the mesh the cadgen engine
+made of it, and a new version fetches only the parts it changed (the shared
+[loading](../../packages/ui/docs/loading.md) playbook). The
 viewport carries opening/update status, centred at its top (a progress icon on
 mobile); initial loading may also use the viewport overlay, and an error is a card over the viewport whose Details keep the complete
 compiler output, whose Retry reloads only that file and whose Report Issue opens a
 new issue titled "Issue: ", labelled `bug`, filled in from the card. A failed update the
 model survives can be dismissed, leaving the previous version to inspect.
 
-A source-checkout backend can restart on Python code changes. This browser host
-polls its identity and reloads when the same endpoint is ready. Installed wheels
-report `autoReload: false` and never enter that loop. Vite 8 handles client HMR,
+The page reloads once its server is other code: it asks `/__cad/server` for its
+`identityToken` (cadgen's version and a digest of its Python and client) and
+reloads on a new one, picking up the client that server serves. A
+source-checkout backend (`autoReload: true`) restarts on Python code changes and is
+asked every 2 s, every 0.4 s while it is down; an installed one, which changes only
+when another install replaces it on its port, every 5 s and whenever the window
+regains focus. The same install restarting does not reload. Vite 8 handles client HMR,
 uses compiled workspace exports and honors an explicit `PORT` while retaining
 strict port binding. React 19 is deduplicated with the shared packages.
 
@@ -272,7 +281,7 @@ silently copying a subset. No receipt claims that another app pasted or sent the
 content. Bundles accept at most 128 parts and one PNG up to 20 MiB; image support
 is advertised only when the browser exposes image clipboard writes. Failed
 operations can be retried, while recent successful operation IDs prevent repeated
-writes. Clipboard operations, prompt delivery and development reload live
+writes. Clipboard operations, prompt delivery and the reload watcher live
 under `src/host`; shared UI receives their explicit ports. The browser file source
 exposes no general write operations.
 
@@ -308,7 +317,7 @@ user's state directory, shared with the CAD app.
 ### Usage stats (telemetry)
 
 cadgen's usage stats (`cadgen/analytics.py`) are on by default once a `cadgen` command has said
-so, once, in its output; nothing in the Viewer asks. **Share usage stats** in the app menu turns
+so, once, in its output; nothing in the Viewer asks. **Share anonymous usage data** in the app menu turns
 them off or on, and the answer is kept in the user's state directory, so one answer counts for
 both apps. The page reads and answers it through the CAD client (`consent`, `/__cad/analytics`),
 and reports a person touching the page (at most every 2 s) to `/__cad/analytics/activity`; a

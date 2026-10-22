@@ -1,8 +1,7 @@
 """The CAD Viewer's HTTP routes, served in-process for a view with no network.
 
-A view sends exactly the requests the web client sends (``/__cad/*``,
-``/__tess_cache/*``) as tool calls; this module hands each one to the viewer's
-own router -- one :class:`~cadgen.viewer.http_app.CadApp`, made on the first
+A view sends exactly the requests the web client sends (``/__cad/*``) as tool
+calls; this module hands each one to the viewer's own router -- one :class:`~cadgen.viewer.http_app.CadApp`, made on the first
 request, for every view of this server -- and returns the status, headers and
 body bytes. There is one backend, not two: the router, its checks and its limits
 are the ones the web app uses, the model library, the home's Open, Reveal, the
@@ -14,8 +13,8 @@ A body travels base64 inside the host's JSON, and a JSON body of more than
 ``GZIP_JSON_MIN_BYTES`` travels gzipped as well, flagged ``encoding: "gzip"``: the
 page inflates it before the client sees it, and the headers describe the inflated
 body. A large model's descriptor is 1.43 MB of base64 as it is and 0.28 MB gzipped,
-for about 5 ms of level-1 compression. Binary bodies (tessellations, SURF objects)
-barely shrink, so they travel as they are.
+for about 5 ms of level-1 compression. Binary bodies (display meshes) barely
+shrink, so they travel as they are.
 
 A reply is one message on the host's channel, and a host reads that channel with
 a ceiling on one message: past it, the connection closes, and this process and
@@ -33,10 +32,13 @@ again, which re-read the file and the store and hashed the whole body for every
 ``KEPT_BODY_SECONDS``, or to make room under ``KEPT_BODIES_MAX_BYTES``; a part
 asked for after that runs the route, as every part once did.
 
-A drawing the store has not drawn yet renders off the request
+A drawing whose bytes the viewer holds no answer for renders off the request
 (``cadgen.viewer.drawings``): here a request waits on it only briefly
 (``DRAWING_HOLD_SECONDS``), since calls share a host's few slots, and the 202
-has the page ask again a moment later (``DRAWING_RETRY_MS``).
+has the page ask again a moment later (``DRAWING_RETRY_MS``). So does a STEP or
+an ``.xbf`` the cadgen engine is still reading (``cadgen.viewer.xbf``:
+``ENGINE_HOLD_SECONDS``, ``ENGINE_RETRY_MS``); and the page's wait for its next
+version is answered at once rather than held: the page asks again a second later.
 """
 
 from __future__ import annotations
@@ -56,7 +58,7 @@ from cadgen.viewer.response import Request, Response
 
 MAX_REQUEST_BODY_BYTES = 256 * 1024 * 1024
 _ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST"})
-_API_PREFIXES = ("/__cad/", "/__tess_cache")
+_API_PREFIXES = ("/__cad/",)
 # The one route whose effect belongs to the host: a view copies through its host's frame, never
 # through the server's clipboard. (No app here has a shutdown: it refuses `/__cad/shutdown` itself.)
 _HOST_EFFECT_ROUTES = frozenset({"/__cad/clipboard"})
@@ -77,6 +79,9 @@ KEPT_BODIES_MAX_BYTES = 256 * 1024 * 1024
 # docstring): about one call a second while a large drawing renders, as a view's sync makes.
 DRAWING_HOLD_SECONDS = 0.25
 DRAWING_RETRY_MS = 750
+# A STEP or an .xbf the engine is still reading holds a call no longer than a drawing does.
+ENGINE_HOLD_SECONDS = 0.25
+ENGINE_RETRY_MS = 750
 _CONTENT_RANGE = re.compile(r"bytes [0-9]+-([0-9]+)/([0-9]+)")
 
 
@@ -145,6 +150,8 @@ class ViewerTunnel:
                 # The server's recorder: a person's answer on a card here is the CAD app's.
                 app.analytics, app.consent_by = self._analytics, "app"
                 app.drawings.hold_seconds, app.drawings.retry_ms = DRAWING_HOLD_SECONDS, DRAWING_RETRY_MS
+                app.engine_documents.hold_seconds, app.engine_documents.retry_ms = ENGINE_HOLD_SECONDS, ENGINE_RETRY_MS
+                app.engine_documents.wait_seconds = 0.0  # a version is answered at once: the page asks again
                 self._app = app
             return self._app
 
@@ -165,14 +172,6 @@ class ViewerTunnel:
             self._revisions[file] = (now, revision)
         return revision
 
-    def preview(self, file: str) -> dict[str, Any]:
-        """One file's build feed, now (the route's ``after`` would hold the request; the view
-        asks again on its next sync)."""
-        try:
-            return self.app.build_status(file)
-        except Exception as error:  # noqa: BLE001 - the feed's failure is the view's to show, as the route's 4xx was
-            return {"error": str(error) or type(error).__name__}
-
     def serve(self, *, method: str, url: str, headers: dict[str, str], body: bytes) -> dict[str, Any]:
         # ``url`` is already text (the view's fetch URL, often absolute against
         # a placeholder origin); the router's own parser drops the authority.
@@ -189,12 +188,6 @@ class ViewerTunnel:
         if body:
             lowered["content-length"] = str(len(body))
         query = url_norm.request_query(url)
-        if path == "/__cad/preview":
-            # The preview feed's ``after`` holds the request until the build ledger moves (up to a
-            # second). Here it answers at once: the host relays every call through a few slots all of
-            # its views share, and a held one keeps another view's model load waiting. The feed paces
-            # an answer that brings nothing new itself.
-            query = url_norm.Query([pair for pair in query if pair[0] != "after"])
         byte_range = lowered.get("range") if method == "GET" else None
         if byte_range and lowered.get("if-range"):
             part = self._kept_part(lowered["if-range"], byte_range)

@@ -105,25 +105,23 @@ if ! pick_interpreter; then
   exit 1
 fi
 echo "    interpreter: $PYTHON"
-# Cold: a smoke test spawns no build daemon.
-export CADGEN_DAEMON=0
-unset CADGEN_BROKER CADGEN_BROKER_KEY CADGEN_BROKER_STATS CADGEN_ROOT_ID
-# Isolated store: content keying would otherwise resolve the fixture against
-# the developer's real cache and skip the import this smoke test exists to run.
-export CADGEN_CACHE_DIR="$(mktemp -d)"
 # A private state directory (the detached viewer's log, the analytics answer) and
 # temporary directory: nothing here touches the developer's own.
 private_tmp="$("$PYTHON" -c 'import tempfile; print(tempfile.mkdtemp(prefix="cv-"))')"
 export TMPDIR="$private_tmp" TEMP="$private_tmp" TMP="$private_tmp"
 export CADGEN_STATE_DIR="$private_tmp/state"
-export CADGEN_DAEMON_STATE_DIR="$private_tmp/daemon"
+# The engine daemon the viewer asks to serve the STEP below: this test's own, in a private
+# folder, stopped on the way out -- and gone by itself after two idle minutes if not.
+export CADGEN_ENGINE_DIR="$private_tmp/engine" CADGEN_ENGINE_IDLE=120
 PORT="$("$PYTHON" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 STARTED=""
 cleanup() {
   if [ -n "$STARTED" ]; then
     "$PYTHON" -m cadgen.viewer stop --port "$PORT" >/dev/null 2>&1 || true
   fi
-  rm -rf "$serve_root" "$CADGEN_CACHE_DIR" "$private_tmp"
+  "$PYTHON" -m cadgen.engine stop >/dev/null 2>&1 \
+    || echo "warning: the test's engine daemon did not stop; it goes once idle" >&2
+  rm -rf "$serve_root" "$private_tmp"
   rm -f "$log"
 }
 trap cleanup EXIT
@@ -199,14 +197,10 @@ if ! printf '%s' "$reuse_json" | grep -q "\"port\":$PORT"; then
   exit 1
 fi
 
-# End-to-end display FROM THE BUNDLE: a raw STEP, named by its absolute path, goes
-# not-compiled -> POST (cadgen's compile entry point, a job in the pool)
-# -> compiled geometry -> a real browser load that derives and fetches its
-# display surface. Its small STEP fixture belongs to this test rather than the
-# repository's shared model workspace. Geometry completion and display readiness
-# are separate contracts: the artifact endpoint must stay "compiled" after the
-# geometry tree lands, while
-# the bundled client drives missing SURF work through /__cad/surfaces.
+# End-to-end display FROM THE BUNDLE: a raw STEP, named by its absolute path, is served by the
+# cadgen engine (the daemon the viewer asks, connect-or-start) and drawn by the bundled client
+# from the engine's part buffers, read through the viewer's own origin (/__cad/xbf/api/...). Its
+# small STEP fixture belongs to this test rather than the repository's shared model workspace.
 FIXTURE="$REPO_ROOT/tests/fixtures/cad/import-smoke.step"
 if ! head -1 "$FIXTURE" | grep -q "ISO-10303-21"; then
   echo "FAIL: import fixture is not STEP text: $FIXTURE" >&2
@@ -214,70 +208,44 @@ if ! head -1 "$FIXTURE" | grep -q "ISO-10303-21"; then
 fi
 cp "$FIXTURE" "$serve_root/smoke.step"
 smoke_ref="$("$PYTHON" -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$serve_root/smoke.step")"
-if [ "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$HOST:$PORT/__cad/artifact?file=smoke.step")" != "400" ]; then
+if [ "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$HOST:$PORT/__cad/xbf?file=smoke.step")" != "400" ]; then
   echo "FAIL: a relative ?file= was not refused (400)" >&2
   exit 1
 fi
-step_url="http://$HOST:$PORT/__cad/artifact?file=$smoke_ref"
-status_json="$(curl -s -m 10 "$step_url")"
-if ! printf '%s' "$status_json" | grep -q '"not-compiled"'; then
-  echo "FAIL: raw STEP did not report not-compiled: $status_json" >&2
-  exit 1
-fi
-if ! printf '%s' "$status_json" | grep -q '"compile":true'; then
-  echo "FAIL: raw STEP status did not offer the compile: $status_json" >&2
-  exit 1
-fi
-# The POST starts the compile and answers at once; the status route says when it
-# has landed. The compile pays one cold interpreter + OCP start, so the wait for
-# that is bounded generously.
-build_json="$(curl -s -m 30 -X POST -H 'x-cadgen-viewer: 1' "$step_url")"
-if ! printf '%s' "$build_json" | grep -q '"ok":true'; then
-  echo "FAIL: the compile did not start: $build_json" >&2
-  exit 1
-fi
-compile_deadline=$((SECONDS + 120))
-status_json="$(curl -s -m 10 "$step_url")"
-until printf '%s' "$status_json" | grep -q '"state":"compiled"'; do
-  if printf '%s' "$status_json" | grep -q '"state":"failed"'; then
-    echo "FAIL: the compile failed: $status_json" >&2
+# The engine reads the STEP once and holds it; until it has, the route answers 202 and is asked
+# again. Its daemon may still be starting, so the wait is bounded generously.
+serve_deadline=$((SECONDS + 120))
+served_json="$(curl -s -m 30 "http://$HOST:$PORT/__cad/xbf?file=$smoke_ref")"
+until printf '%s' "$served_json" | grep -q '"url":"/__cad/xbf/api/doc/'; do
+  if printf '%s' "$served_json" | grep -q '"error"'; then
+    echo "FAIL: the engine did not serve the STEP: $served_json" >&2
     exit 1
   fi
-  if [ "$SECONDS" -ge "$compile_deadline" ]; then
-    echo "FAIL: compiled STEP did not settle compiled: $status_json" >&2
+  if [ "$SECONDS" -ge "$serve_deadline" ]; then
+    echo "FAIL: the engine did not serve the STEP in time: $served_json" >&2
     exit 1
   fi
   sleep 0.5
-  status_json="$(curl -s -m 10 "$step_url")"
+  served_json="$(curl -s -m 30 "http://$HOST:$PORT/__cad/xbf?file=$smoke_ref")"
 done
-# The tree lands in the (isolated) store, keyed by the document's bytes.
-if ! ls "$CADGEN_CACHE_DIR"/index/document/* > /dev/null 2>&1; then
-  echo "FAIL: compile reported compiled but the store indexes no document" >&2
-  exit 1
-fi
-catalog_json="$(curl -s -m 10 "http://$HOST:$PORT/__cad/catalog?file=$smoke_ref")"
-if ! printf '%s' "$catalog_json" | grep -q '"url":"/__cad/store?file='; then
-  echo "FAIL: the compiled STEP's catalog row did not name its immutable tree: $catalog_json" >&2
-  exit 1
-fi
 
-# Loading the page is load-bearing. Merely accepting the new compiled state
-# would let this smoke pass with a dead display path: a cold isolated store has
-# no SURF or TESS entries, so the bundled client must request exact surface
-# derivation, fetch the pinned SURF bytes, tessellate them, and clear its loading
-# overlay. CI installs Playwright's Chromium with requirements-dev.txt.
+# Loading the page is load-bearing: the client must read the document's structure and its part
+# buffers through the viewer, draw them, and clear its loading overlay. CI installs Playwright's
+# Chromium with requirements-dev.txt.
 "$PYTHON" - "http://$HOST:$PORT/?file=$smoke_ref" "$(cat "$REPO_ROOT/VERSION")" <<'PY'
+import re
 import sys
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
 
 url = sys.argv[1]
 responses = []
 page_errors = []
-surface_payload = None
-surface_fetches = set()
+structure = False
+part_reads = 0
+PART = re.compile(r"^/__cad/xbf/api/doc/[^/]+/part/[^/]+$")
 
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(
@@ -302,42 +270,32 @@ with sync_playwright() as playwright:
             current = responses[seen:]
             seen = len(responses)
             for response in current:
-                request = response.request
-                parsed = urlparse(response.url)
-                if parsed.path == "/__cad/surfaces" and request.method == "POST" and response.ok:
-                    payload = response.json()
-                    components = payload.get("components") if isinstance(payload, dict) else None
-                    if components and all(row.get("state") == "ready" for row in components.values()):
-                        surface_payload = payload
-                elif parsed.path == "/__cad/store" and response.ok:
-                    query = parse_qs(parsed.query)
-                    if query.get("tree") and query.get("surfaceInput") and query.get("object"):
-                        surface_fetches.add(response.url)
-
+                path = urlparse(response.url).path
+                if not response.ok:
+                    continue
+                if re.fullmatch(r"/__cad/xbf/api/doc/[^/]+", path):
+                    structure = True
+                elif PART.match(path):
+                    part_reads += 1
             overlay_gone = page.locator(".cad-loading-overlay").count() == 0
-            if surface_payload and surface_fetches and overlay_gone:
+            if structure and part_reads and overlay_gone:
                 break
 
         if page_errors:
             raise RuntimeError("browser page error: " + " | ".join(page_errors))
-        if not surface_payload:
-            raise RuntimeError("bundled client did not complete a cold /__cad/surfaces request")
-        rows = surface_payload["components"]
-        missing = [
-            cid for cid, row in rows.items()
-            if not any(fetch.endswith(row["url"]) for fetch in surface_fetches)
-        ]
-        if missing:
-            raise RuntimeError("bundled client did not fetch pinned SURF bytes for: " + ", ".join(missing))
+        if not structure:
+            raise RuntimeError("bundled client did not read the document's structure through the viewer")
+        if not part_reads:
+            raise RuntimeError("bundled client read no part buffer through the viewer")
         if page.locator(".cad-loading-overlay").count():
-            raise RuntimeError("bundled client did not finish tessellating the display surface")
+            raise RuntimeError("bundled client did not finish drawing the display surface")
         canvases = page.locator("canvas")
         if not canvases.count() or not any(canvases.nth(index).is_visible() for index in range(canvases.count())):
-            raise RuntimeError("bundled client completed surface work without a visible canvas")
+            raise RuntimeError("bundled client read the part buffers without a visible canvas")
         alerts = [text.strip() for text in page.locator('[role="alert"]').all_text_contents() if text.strip()]
         if alerts:
             raise RuntimeError("bundled client reported an alert: " + " | ".join(alerts))
-        print(f"    bundled client displayed {len(rows)} cold-derived surface component(s)")
+        print(f"    bundled client drew the STEP the engine served ({part_reads} part buffer(s) read)")
     finally:
         browser.close()
 PY
@@ -353,5 +311,5 @@ if curl -s -o /dev/null -m 3 "http://$HOST:$PORT/__cad/server"; then
   exit 1
 fi
 
-echo "    served / and /__cad/server on port $PORT; cadgen step compile + bundled display e2e OK; reuse/stop OK"
+echo "    served / and /__cad/server on port $PORT; the engine's STEP + bundled display e2e OK; reuse/stop OK"
 echo "==> CAD Viewer launch smoke test passed"

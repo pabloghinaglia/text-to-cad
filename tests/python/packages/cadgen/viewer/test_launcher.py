@@ -30,7 +30,6 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -168,9 +167,6 @@ class LauncherFixture(unittest.TestCase):
                 "TEMP": self.home,
                 "TMP": self.home,
                 "CADGEN_STATE_DIR": self.state,
-                # A launch warms the build daemon, which would be one per test, its workers left
-                # running after it. PrewarmsTheDaemon opts in.
-                "CADGEN_DAEMON": "0",
             }
         )
         env.update(overrides)
@@ -416,10 +412,10 @@ class StagedApp(LauncherFixture):
 
     @staticmethod
     def change_runtime_code(staged: str) -> None:
-        """Edit runtime code OUTSIDE cadgen.viewer, as a pull would: the viewer imports the
-        daemon's transport, so this re-keys the identity and, in a checkout, trips the
+        """Edit runtime code OUTSIDE cadgen.viewer, as a pull would: the viewer imports
+        cadgen's telemetry, so this re-keys the identity and, in a checkout, trips the
         auto-reload watcher."""
-        runtime_file = Path(StagedApp.staged_sources(staged), "cadgen", "daemon", "transport.py")
+        runtime_file = Path(StagedApp.staged_sources(staged), "cadgen", "analytics.py")
         runtime_file.write_text(
             runtime_file.read_text(encoding="utf-8") + "\n# changed runtime\n", encoding="utf-8"
         )
@@ -667,40 +663,6 @@ class Detach(LauncherFixture):
         self.assertEqual(env["CADGEN_STATE_DIR"], self.state)
         self.assertNotIn("DO_NOT_TRACK", env)
         self.assertNotIn("CADGEN_TELEMETRY", env)
-
-class PrewarmsTheDaemon(LauncherFixture):
-    """After its announcement a launch starts the build daemon, whose workers import
-    build123d before any build asks: a session's first build finds them warm."""
-
-    def test_a_launch_leaves_a_daemon_answering(self) -> None:
-        from cadgen.daemon import client
-        from tests.python.support.daemon_cleanup import retire_owned_daemon
-
-        state = tempfile.mkdtemp(prefix="cgv-")  # short: a Unix socket path caps near 104 bytes
-        daemon_env = {
-            "CADGEN_DAEMON": "1",
-            "CADGEN_DAEMON_STATE_DIR": state,
-            "CADGEN_DAEMON_SOCKET": (rf"\\.\pipe\cadgen-test-{uuid.uuid4().hex}" if os.name == "nt"
-                                     else os.path.join(state, "d.sock")),
-            "CADGEN_CACHE_DIR": os.path.join(state, "store"),
-        }
-        self.addCleanup(shutil.rmtree, state, True)
-
-        def retire() -> None:
-            with mock.patch.dict(os.environ, daemon_env):
-                if client.status() is not None:
-                    retire_owned_daemon(daemon_env["CADGEN_DAEMON_SOCKET"])
-
-        self.addCleanup(retire)  # before the fixture's directories go: the daemon stands in one
-        child = self.launch(["--dist", self.make_dist(), "--json", "--new"], **daemon_env)
-        self.wait_for_url_line(child)
-        with mock.patch.dict(os.environ, daemon_env):
-            deadline = time.monotonic() + 60
-            while client.status() is None:
-                if time.monotonic() >= deadline:
-                    self.fail("no build daemon answered after the viewer started")
-                time.sleep(0.1)
-
 
 class Stop(LauncherFixture):
     def test_stop_asks_the_viewer_on_its_port_to_exit(self) -> None:

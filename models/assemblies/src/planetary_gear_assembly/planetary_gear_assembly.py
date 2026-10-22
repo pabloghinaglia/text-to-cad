@@ -1,8 +1,8 @@
 from __future__ import annotations
-from cadgen import glb, step, stl, threemf
+from cadgen.engine import configuration, couple, glb, motion, xbf
 from math import cos, pi, sin, tau
 
-from cadgen import build123d as bd
+import build123d as bd
 
 
 # Units: millimeters.
@@ -38,12 +38,8 @@ def _srgb_channel_to_linear(channel: int) -> float:
 
 
 def _srgb_color(hex_color: str) -> tuple[float, float, float, float]:
-    """Linear RGBA for an ``#rrggbb`` sRGB hex.
-
-    A plain tuple rather than ``bd.Color``: build123d's ``Shape.color`` setter
-    builds the Color on assignment, and a module-level ``bd.Color(...)`` would
-    import the CAD kernel before the @step freshness gate runs.
-    """
+    """Linear RGBA for an ``#rrggbb`` sRGB hex: build123d's ``Shape.color``
+    setter builds the Color on assignment."""
     value = hex_color.removeprefix("#")
     if len(value) != 6:
         raise ValueError(f"Expected #rrggbb color, got {hex_color!r}")
@@ -229,123 +225,39 @@ def _planet_center(index: int) -> tuple[float, float]:
     return _polar_point(PLANET_CENTER_RADIUS, angle)
 
 
-
-
 # ---------------------------------------------------------------------------
-# Kinematics (typed mates; design/pose-animation-split.md). The gear train is
-# exact fixed-ring planetary ratios expressed as one "drive" coupling over the
-# mate DOFs; 3.5 sun revolutions (1260 deg) returns the carrier to 360 deg and
-# every gear to an equivalent tooth phase. Presentation (cutaway styles,
-# orbit-guide overlay) retired with the pose framework; choreography lives in
-# the embedded ANIMATION_JS source below.
+# Kinematics: build123d joints, connected at 0 where the parts stand. The ring
+# is the ground; the sun and the carrier turn on it, each planet turns on the
+# carrier, and each pin is fastened to the carrier. The gear train is one
+# locked coupling, `drive` (the sun's angle), over the exact fixed-ring
+# planetary ratios: 3.5 sun revolutions (1260 deg) return the carrier to 360
+# deg and every gear to an equivalent tooth phase, so `meshCycle`, the drive
+# swept once over 6 s and looped, plays without a seam.
 # ---------------------------------------------------------------------------
-
-import cadgen
 
 _CARRIER_RATIO = SUN_TEETH / (SUN_TEETH + RING_TEETH)          # 24/84
 _PLANET_RATIO = -(SUN_TEETH / PLANET_TEETH) * (1 - _CARRIER_RATIO)
 _FULL_MESH_CYCLE_DEG = 1260
 
 
-def _planetary_kinematics():
-    ring = "#ring_gear_60_internal_teeth"
-    carrier = "#carrier_plate"
-    mates = [
-        cadgen.revolute("sun", parent=ring, child="#sun_gear_24_teeth",
-                        origin=(0, 0, 0), direction=(0, 0, 1),
-                        limits=(-_FULL_MESH_CYCLE_DEG, _FULL_MESH_CYCLE_DEG)),
-        cadgen.revolute("carrier", parent=ring, child=carrier,
-                        origin=(0, 0, 0), direction=(0, 0, 1), limits=(-360, 360)),
-    ]
-    gears = {"sun": 1.0, "carrier": _CARRIER_RATIO}
-    for index in range(PLANET_COUNT):
-        number = index + 1
-        cx, cy = _planet_center(index)
-        # Planet spin composes on the carrier's rotation through the MATE
-        # tree; the pins are siblings in the instance tree, so a fastened
-        # mate is what carries them with the carrier.
-        mates.append(cadgen.revolute(
-            f"planet{number}", parent=carrier, child=f"#planet_gear_{number}_18_teeth",
-            origin=(cx, cy, 0), direction=(0, 0, 1),
-            limits=(-4 * _FULL_MESH_CYCLE_DEG, 4 * _FULL_MESH_CYCLE_DEG)))
-        mates.append(cadgen.fastened(
-            f"pin{number}", parent=carrier, child=f"#planet_pin_{number}"))
-        gears[f"planet{number}"] = _PLANET_RATIO
-    return {
-        "mates": mates,
-        "couplings": [cadgen.couple("drive", gears, limits=(0, _FULL_MESH_CYCLE_DEG))],
-        "poses": {
-            "quarter_cycle": {"drive": _FULL_MESH_CYCLE_DEG / 4},
-            "half_cycle": {"drive": _FULL_MESH_CYCLE_DEG / 2},
-        },
-    }
+def _revolute(fixed, moving, label: str, center: tuple[float, float], limits: tuple[float, float]) -> None:
+    """``moving`` turns about +Z through ``center`` on ``fixed``."""
+    point = (center[0], center[1], 0.0)
+    bd.RevoluteJoint(label, fixed, axis=bd.Axis(point, (0.0, 0.0, 1.0)), angular_range=limits)
+    bd.RigidJoint(label, moving, bd.Plane(origin=point, z_dir=(0.0, 0.0, 1.0)).location)
+    fixed.joints[label].connect_to(moving.joints[label], angle=0.0)
 
 
-ANIMATION_JS = r'''// Choreography for the planetary gear stage (copied into the sidecar at
-// build; the viewer's Animation tab is the only consumer). Raw transforms by
-// design: animation knows nothing of the mate graph, so the exact fixed-ring
-// ratios are restated here.
-const FULL_MESH_CYCLE_DEG = 1260;
-const CARRIER_RATIO = 24 / (24 + 60);
-const PLANET_RATIO = -(24 / 18) * (1 - CARRIER_RATIO);
-const Z = [0, 0, 1];
-const PLANETS = [
-  { gear: "planet_gear_1_18_teeth", pin: "planet_pin_1", center: [42, 0, 0], radial: [1, 0, 0] },
-  { gear: "planet_gear_2_18_teeth", pin: "planet_pin_2", center: [-21, 36.373067, 0], radial: [-0.5, 0.8660254, 0] },
-  { gear: "planet_gear_3_18_teeth", pin: "planet_pin_3", center: [-21, -36.373067, 0], radial: [-0.5, -0.8660254, 0] },
-];
-
-function driveTrain(m, driveDeg) {
-  const carrierDeg = driveDeg * CARRIER_RATIO;
-  m.get("sun_gear_24_teeth").rotate(Z, driveDeg, [0, 0, 0]);
-  m.get("carrier_plate").rotate(Z, carrierDeg, [0, 0, 0]);
-  for (const planet of PLANETS) {
-    const gear = m.get(planet.gear);
-    // Spin about the planet's own (rest) center first, then orbit with the
-    // carrier: successive calls premultiply, so the spin rides the orbit.
-    gear.rotate(Z, driveDeg * PLANET_RATIO, planet.center);
-    gear.rotate(Z, carrierDeg, [0, 0, 0]);
-    m.get(planet.pin).rotate(Z, carrierDeg, [0, 0, 0]);
-  }
-}
-
-const ease = { sine: (t) => 0.5 - 0.5 * Math.cos(Math.PI * 2 * t) };
-
-export const clips = {
-  meshCycle: {
-    label: "Mesh cycle",
-    duration: 6,
-    update(t, m) {
-      driveTrain(m, (t / 6) * FULL_MESH_CYCLE_DEG);
-    },
-  },
-  inspectExplode: {
-    label: "Explode inspect",
-    duration: 5,
-    update(t, m) {
-      const progress = t / 5;
-      driveTrain(m, progress * FULL_MESH_CYCLE_DEG);
-      const explode = ease.sine(progress) * 16;
-      for (const planet of PLANETS) {
-        const shift = planet.radial.map((v) => v * explode);
-        m.get(planet.gear).translate(shift);
-        m.get(planet.pin).translate(shift);
-      }
-      m.get("sun_gear_24_teeth").translate([0, 0, (explode / 16) * 7]);
-      m.get("carrier_plate").translate([0, 0, (explode / 16) * -4]);
-      for (const planet of PLANETS) {
-        m.get(planet.pin).translate([0, 0, (explode / 16) * -4]);
-      }
-    },
-  },
-};
-'''
+def _fastened(fixed, moving, label: str, center: tuple[float, float]) -> None:
+    """``moving`` fixed to ``fixed`` where it stands."""
+    location = bd.Location((center[0], center[1], 0.0))
+    bd.RigidJoint(label, fixed, location)
+    bd.RigidJoint(label, moving, location)
+    fixed.joints[label].connect_to(moving.joints[label])
 
 
-@step(out="../../STEP/planetary_gear_assembly/planetary_gear_assembly.step", kinematics=_planetary_kinematics(), animation=ANIMATION_JS)
-@stl(out="../../STL/planetary_gear_assembly/planetary_gear_assembly.stl")
-@threemf(out="../../3MF/planetary_gear_assembly/planetary_gear_assembly.3mf")
-@glb(out="../../GLB/planetary_gear_assembly/planetary_gear_assembly.glb")
+@xbf(out="../../XBF/planetary_gear_assembly/planetary_gear_assembly.xbf")
+@glb(out="../../XBF/planetary_gear_assembly/planetary_gear_assembly.glb")
 def planetary_gear_assembly():
     """Return a labeled simplified planetary gear assembly in millimeters."""
     sun_pitch_angle = tau / SUN_TEETH
@@ -386,12 +298,29 @@ def planetary_gear_assembly():
         )
         parts.append(_make_planet_pin(label=f"planet_pin_{index + 1}", center=center))
 
+    carrier, ring, sun = parts[:3]
+    # Each planet and pin on the carrier before the carrier turns on the ring.
+    for index in range(PLANET_COUNT):
+        planet, pin = parts[3 + 2 * index], parts[4 + 2 * index]
+        center = _planet_center(index)
+        limits = (-4 * _FULL_MESH_CYCLE_DEG, 4 * _FULL_MESH_CYCLE_DEG)
+        _revolute(carrier, planet, f"planet{index + 1}", center, limits)
+        _fastened(carrier, pin, f"pin{index + 1}", center)
+    _revolute(ring, sun, "sun", (0.0, 0.0), (-_FULL_MESH_CYCLE_DEG, _FULL_MESH_CYCLE_DEG))
+    _revolute(ring, carrier, "carrier", (0.0, 0.0), (-360.0, 360.0))
+
     assembly = bd.Compound(
         obj=parts,
         children=parts,
         label="simplified_planetary_gear_assembly",
     )
-    return assembly
+    planets = {f"planet{index + 1}": _PLANET_RATIO for index in range(PLANET_COUNT)}
+    couple(assembly, "drive", range=(0, _FULL_MESH_CYCLE_DEG), lock=True,
+           sun=1.0, carrier=_CARRIER_RATIO, **planets)
+    configuration(assembly, "quarter_cycle", drive=_FULL_MESH_CYCLE_DEG / 4)
+    configuration(assembly, "half_cycle", drive=_FULL_MESH_CYCLE_DEG / 2)
+    return motion(assembly, "meshCycle", sweep={"drive": (0, _FULL_MESH_CYCLE_DEG)}, duration=6,
+                  ease="linear", loop="loop")
 
 
 if __name__ == "__main__":

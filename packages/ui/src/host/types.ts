@@ -8,12 +8,13 @@ export interface ClipboardPort {
    * starts inside the gesture that asked for it and takes the text when it arrives.
    */
   writeText(text: string | Promise<string>): Promise<void>;
-  readText(): Promise<string>;
+  /** Read where the host exposes paste from its clipboard. */
+  readText?(): Promise<string>;
   writeImage(image: Blob | Promise<Blob>): Promise<void>;
 }
 /**
  * A Quick Edit's .snapshot.json, made at Copy/Queue/Send: shared input, inline annotation
- * and measurements, with one job per drawn view (`cadgen snapshot --job` renders them).
+ * and measurements, with one job per drawn view (`cadgen snapshot --annotation PACKET --camera authored` draws each).
  * `create` returns compact inline JSON up to 1024 UTF-8 bytes, otherwise writes it and answers its path; `read` fetches it. `createHttpPromptFiles` (`@text-to-cad/core/client`) is the
  * viewer server's.
  */

@@ -5,9 +5,8 @@ import { createBridge, HostError, type ToolResult } from './bridge';
 import { frameClipboard } from './clipboard';
 import { chatReach, createChatPromptContext } from './prompt';
 import { createServer, type SyncReply, type SyncRequest, type ViewEvent } from './server';
-import { createViewSync, LOST_AFTER, NEWS_MS, SYNC_MS } from './sync';
-import { createHttpTessellationCacheProvider, encodeComponentTessellation, tessellationPayloadFacts } from '@text-to-cad/core/lib/surf/tessellationCache.js';
-import { createTunnelClient, createTunnelFetch, decodeBase64, TUNNEL_ORIGIN, TUNNEL_REPLY_MAX_BYTES } from './tunnel';
+import { createViewSync, LOST_AFTER, SYNC_MS } from './sync';
+import { createTunnelFetch, decodeBase64, TUNNEL_ORIGIN, TUNNEL_REPLY_MAX_BYTES } from './tunnel';
 
 /** A host frame: records what the page posts and answers with `respond`. */
 function fakeHost(respond: (message: any) => unknown) {
@@ -94,7 +93,7 @@ describe('a view\'s one call each second', () => {
       const sync = createViewSync(server, { id: 'v1', surface: 'tab', model: () => '/p/a.step' }, {
         show: next => shown.push(next.model),
         capture: async () => { const png = captures.shift(); if (!png) throw new Error('nothing to capture'); return png; },
-        state: () => ({ model: '/p/a.step', selection: ['/p/a.step#o1.f2'] }),
+        state: () => ({ model: '/p/a.step', selection: ['/p/a.step#o:3f2a9c1d7e5b/f:bracket.extrude1.3'] }),
       });
       sync.run(stop.signal);
       await vi.advanceTimersByTimeAsync(0);
@@ -105,7 +104,7 @@ describe('a view\'s one call each second', () => {
       expect(requests).toHaveLength(4);
       // What the view shows goes up once, and again only when it changes.
       expect(requests.map(request => Boolean(request.state))).toEqual([true, false, false, false]);
-      expect(requests[0]).toMatchObject({ view: 'v1', surface: 'tab', model: '/p/a.step', state: { selection: ['/p/a.step#o1.f2'] } });
+      expect(requests[0]).toMatchObject({ view: 'v1', surface: 'tab', model: '/p/a.step', state: { selection: ['/p/a.step#o:3f2a9c1d7e5b/f:bracket.extrude1.3'] } });
       expect(shown).toEqual(['/p/b.step']);
       expect(replied).toEqual(expect.arrayContaining([
         { requestId: 'c1', png: encodeBase64(new Uint8Array([1, 2, 3])) },
@@ -156,14 +155,14 @@ describe('a view\'s one call each second', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it('reads the catalog again only when its revision moves past the one applied, and carries a STEP\'s build feed', async () => {
+  it('reads the catalog again only when its revision moves past the one applied', async () => {
     vi.useFakeTimers();
     try {
       const { server, requests } = syncing([
         { catalog: { revision: 'r1' } },
-        { catalog: { revision: 'r2' }, previews: [{ file: 'a.step', state: 'building', feedCursor: 'k1' }] as SyncReply['previews'] },
-        { catalog: { revision: 'r2' }, previews: [{ file: 'a.step', state: 'done', feedCursor: 'k2' }] as SyncReply['previews'] },
-        { catalog: { revision: 'r2' }, previews: [{ file: 'a.step', state: 'done', feedCursor: 'k2' }] as SyncReply['previews'] },
+        { catalog: { revision: 'r2' } },
+        { catalog: { revision: 'r2' } },
+        { catalog: { revision: 'r2' } },
       ]);
       let applied = 'r1';
       const refreshes: (string | null)[] = [];
@@ -172,49 +171,15 @@ describe('a view\'s one call each second', () => {
         { show() {}, capture: async () => new Blob(), state: () => ({}) });
       sync.watch({ file: () => '/p/a.step', revision: () => applied,
         refresh: async file => { refreshes.push(file); applied = 'r2'; } });
-      const feed: string[] = [];
-      sync.observePreview('a.step', preview => feed.push(String(preview.state)), () => {});
       sync.run(stop.signal);
       await vi.advanceTimersByTimeAsync(0);
-      expect(requests[0].watch).toEqual({ file: '/p/a.step', previews: ['a.step'] });
+      expect(requests[0].watch).toEqual({ file: '/p/a.step' });
       expect(refreshes).toEqual([]);
       await vi.advanceTimersByTimeAsync(SYNC_MS);
       expect(refreshes).toEqual(['/p/a.step']);
-      // A moving build is asked after sooner; a still one waits the second.
-      expect(feed).toEqual(['building']);
-      await vi.advanceTimersByTimeAsync(NEWS_MS);
-      expect(feed).toEqual(['building', 'done']);
-      await vi.advanceTimersByTimeAsync(NEWS_MS);
-      expect(feed).toEqual(['building', 'done', 'done']);
-      await vi.advanceTimersByTimeAsync(NEWS_MS);
+      await vi.advanceTimersByTimeAsync(2 * SYNC_MS);
       expect(requests).toHaveLength(4);
       expect(refreshes).toEqual(['/p/a.step']);
-      stop.abort();
-    } finally { vi.useRealTimers(); }
-  });
-
-  it('hands the view a failed build as news, and only a bare error as the feed failing', async () => {
-    vi.useFakeTimers();
-    try {
-      const { server } = syncing([
-        { previews: [{ file: 'a.step', epoch: 'e', revision: 3, state: 'failed', error: 'the model raised', feedCursor: 'k1' }] as SyncReply['previews'] },
-        { previews: [{ file: 'a.step', error: 'the daemon did not answer' }] as SyncReply['previews'] },
-      ]);
-      const stop = new AbortController();
-      const sync = createViewSync(server, { id: 'v1', surface: 'inline', model: () => '/p/a.step' },
-        { show() {}, capture: async () => new Blob(), state: () => ({}) });
-      sync.watch({ file: () => '/p/a.step', revision: () => 'r1', refresh: async () => {} });
-      const updates: string[] = [];
-      const lost: string[] = [];
-      sync.observePreview('a.step', preview => updates.push(`${preview.state}: ${preview.error}`),
-        error => lost.push(error instanceof Error ? error.message : String(error)));
-      sync.run(stop.signal);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(updates).toEqual(['failed: the model raised']);
-      expect(lost).toEqual([]);
-      await vi.advanceTimersByTimeAsync(NEWS_MS);
-      expect(lost).toEqual(['the daemon did not answer']);
-      expect(updates).toEqual(['failed: the model raised']);
       stop.abort();
     } finally { vi.useRealTimers(); }
   });
@@ -230,8 +195,8 @@ describe('the fetch tunnel', () => {
       },
     });
     const tunnel = createTunnelFetch(server);
-    const posted = await tunnel(`${TUNNEL_ORIGIN}/__cad/surfaces?x=1`, { method: 'POST', headers: { 'x-cadgen-viewer': '1' }, body: '{"a":1}' });
-    expect(calls[0]).toMatchObject({ name: 'cad_http', args: { method: 'POST', url: `${TUNNEL_ORIGIN}/__cad/surfaces?x=1` } });
+    const posted = await tunnel(`${TUNNEL_ORIGIN}/__cad/parts?x=1`, { method: 'POST', headers: { 'x-cadgen-viewer': '1' }, body: '{"a":1}' });
+    expect(calls[0]).toMatchObject({ name: 'cad_http', args: { method: 'POST', url: `${TUNNEL_ORIGIN}/__cad/parts?x=1` } });
     expect(calls[0].args.headers['x-cadgen-viewer']).toBe('1');
     expect(new TextDecoder().decode(decodeBase64(calls[0].args.body))).toBe('{"a":1}');
     expect(posted.status).toBe(201);
@@ -260,19 +225,6 @@ describe('the fetch tunnel', () => {
     await expect(tunnel(`${TUNNEL_ORIGIN}/__cad/catalog`)).rejects.toThrow(TypeError);
   });
 
-  it('gives the app a CAD client whose batched reads ask for no more than one reply carries', () => {
-    const client = createTunnelClient(createTunnelFetch(createServer({ callTool: async () => ({}) })));
-    const session = client.createRenderSession();
-    try {
-      expect(TUNNEL_REPLY_MAX_BYTES).toBe(4 * 1024 * 1024);
-      expect(session.tessellationCache.batchMaxBytes).toBe(TUNNEL_REPLY_MAX_BYTES);
-      expect(client.origin).toBe(TUNNEL_ORIGIN);
-    } finally {
-      session.dispose();
-      client.dispose();
-    }
-  });
-
   it('reads a body longer than one reply a part at a time, each within the bound and naming the body it continues, and hands over the whole', async () => {
     const bytes = pattern(3 * TUNNEL_REPLY_MAX_BYTES + 1000);
     const parted = servingInParts(bytes);
@@ -294,33 +246,6 @@ describe('the fetch tunnel', () => {
       const reply = await createTunnelFetch(parted.server)(`${TUNNEL_ORIGIN}/__cad/asset?file=big.stl`);
       await expect(reply.arrayBuffer()).rejects.toThrow(TypeError);
     }
-  });
-
-  it('verifies a tessellation read in parts as a whole one: put together it is the body, and a damaged part makes it a miss', async () => {
-    const vertices = 200_000;
-    const triangles = 50_000;
-    const bytes = encodeComponentTessellation({
-      positions: new Float32Array(3 * vertices).map((_, index) => index % 97),
-      normals: new Float32Array(3 * vertices).fill(1),
-      faceOrds: new Float32Array(vertices).fill(1),
-      indices: new Uint32Array(3 * triangles).map((_, index) => index % vertices),
-      sideOrds: new Uint32Array(3 * triangles).fill(1),
-      faceRanges: [{ ord: 1, indexStart: 0, indexCount: 3 * triangles }],
-      edges: [],
-      bounds: { min: [0, 0, 0], max: [96, 96, 96] },
-      scale: 166,
-    }, { surfaceInput: '1'.repeat(64), surfaceObject: 'a'.repeat(64), edgeClasses: [] });
-    expect(bytes.length).toBeGreaterThan(TUNNEL_REPLY_MAX_BYTES);
-    const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(byte => byte.toString(16).padStart(2, '0')).join('');
-    const row = { schemaVersion: 1, object: digest, ...tessellationPayloadFacts(bytes) };
-    const read = (parted: ReturnType<typeof servingInParts>) => createHttpTessellationCacheProvider({
-      origin: TUNNEL_ORIGIN, fetch: createTunnelFetch(parted.server), maxBatchBytes: TUNNEL_REPLY_MAX_BYTES,
-    }).getProbed(row, { maxBytes: row.byteLength });
-    const whole = await read(servingInParts(bytes, { etag: () => `"${digest}"` }));
-    expect(whole && same(whole, bytes)).toBe(true);
-    const damaged = servingInParts(bytes, { etag: () => `"${digest}"`, alter: (part, first) => (first === TUNNEL_REPLY_MAX_BYTES ? part.map(value => value ^ 1) : part) });
-    expect(await read(damaged)).toBeNull();
-    expect(damaged.ranges.length).toBe(2);
   });
 });
 
@@ -366,7 +291,7 @@ function servingInParts(bytes: Uint8Array, {
 
 describe('a Quick Edit in the chat', () => {
   const file = referencePart({ resource: { kind: 'workspace-file', path: '/project/parts/a.step' }, target: { kind: 'whole-resource' } }, 'file');
-  const face = referencePart({ resource: { kind: 'workspace-file', path: '/project/parts/a.step' }, target: { kind: 'cad-selector', selectors: ['o1.f2'] } }, 'face');
+  const face = referencePart({ resource: { kind: 'workspace-file', path: '/project/parts/a.step' }, target: { kind: 'cad-selector', selectors: ['o:1a2b3c4d5e6f/f:base.extrude1.2'] } }, 'face');
   const annotation = () => ({ id: 'annotation', kind: 'attachment' as const, name: 'a.annotation.json', label: 'Annotation', mimeType: 'application/json', about: ['file'],
     content: { then: () => { throw new Error('JSON bytes must not be read for handoff'); } }, path: Promise.resolve('/tmp/p/a-1.annotation.json') });
   // The snapshot packet: a file, never an image, always named by where it was made.
@@ -393,7 +318,7 @@ describe('a Quick Edit in the chat', () => {
     const [text] = updates[0].params.content;
     expect(updates[0].params.content).toHaveLength(1);
     expect(updates[0].method).toBe('ui/update-model-context');
-    expect(text).toEqual({ type: 'text', text: 'Round it.\n\nFile: /project/parts/a.step\nReferences:\n/project/parts/a.step#o1.f2\nAnnotation: /tmp/p/a-1.annotation.json', _meta: { 'openai/title': 'Quick edit · a.step' } });
+    expect(text).toEqual({ type: 'text', text: 'Round it.\n\nFile: /project/parts/a.step\nReferences:\n/project/parts/a.step#o:1a2b3c4d5e6f/f:base.extrude1.2\nAnnotation: /tmp/p/a-1.annotation.json', _meta: { 'openai/title': 'Quick edit · a.step' } });
     await port.deliver(edit());
     expect(updates[1].params.content).toHaveLength(2);
     // The host cleared the context (the message went out): the next one starts afresh.

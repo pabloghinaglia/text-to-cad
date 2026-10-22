@@ -30,7 +30,7 @@ exits once it has announced itself — the spelling for agents and scripts,
 which wait for a command to finish. ``cadgen viewer stop [--port N]`` asks the
 viewer on a port to exit.
 
-``--api-only`` serves the two API prefixes and nothing else, because Vite owns
+``--api-only`` serves the API (``/__cad``) and nothing else, because Vite owns
 the client — this is what lets ``npm run dev`` work on a checkout that has never
 been built; ``npm run dev`` runs it with ``--new``.
 
@@ -186,7 +186,7 @@ _HELP = {
     "json": "announce the instance as one JSON line on stdout",
     "detach": "run the server in the background: print its URL, then return",
     "dist": "built client to serve (default: the bundled client; env CADGEN_VIEWER_DIST)",
-    "api_only": "serve only /__cad and /__tess_cache (a dev server owns the client)",
+    "api_only": "serve only /__cad (a dev server owns the client)",
 }
 
 
@@ -433,16 +433,6 @@ class _LateApp:
         response.send_json(503, {"ok": False, "error": "server starting"})
 
 
-def _prewarm_daemon() -> None:
-    """Start the build daemon. Best-effort: without one, the viewer serves what it did."""
-    from cadgen.daemon.client import prewarm  # noqa: PLC0415 - kernel-free, needed only now
-
-    try:
-        prewarm()
-    except Exception:  # noqa: BLE001 - a daemon that cannot start is the first build's to report
-        pass
-
-
 def _harden_streams() -> None:
     """Degrade an unencodable character to an escape instead of raising.
 
@@ -524,6 +514,20 @@ def _read_lines(path: str) -> list[str]:
         return []
 
 
+def _detach_kwargs() -> dict:
+    """How to start a process that outlives the command that started it.
+
+    ``start_new_session`` is POSIX-only and Windows does not merely ignore it -- it is named
+    ``unused_start_new_session`` in subprocess, so passing it there is silently nothing and the
+    process would share its parent's console and die with it. On Windows it gets a console of its
+    own with no window (``CREATE_NO_WINDOW``), never no console at all (``DETACHED_PROCESS``): every
+    console program a process without a console starts gets a NEW console, with a window (#597).
+    """
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
 def launch_detached(argv: list[str], *, as_json: bool, prog: str = DEFAULT_PROG) -> int:
     """``--detach``: start the same launch as a background process, relay its
     announcement, and RETURN.
@@ -551,8 +555,6 @@ def launch_detached(argv: list[str], *, as_json: bool, prog: str = DEFAULT_PROG)
     child_argv = [item for item in argv if item != "--detach"]
     if "--json" not in child_argv:
         child_argv.append("--json")
-    from cadgen.daemon.client import detach_kwargs  # noqa: PLC0415 - kernel-free, needed only now
-
     log_file = log_path()
     try:
         with open(log_file, "wb") as log:
@@ -564,7 +566,7 @@ def launch_detached(argv: list[str], *, as_json: bool, prog: str = DEFAULT_PROG)
                 close_fds=True,
                 # It outlives this command, so it goes by the person's telemetry settings, not this shell's.
                 env=for_others(os.environ),
-                **detach_kwargs(),
+                **_detach_kwargs(),
             )
     except OSError as error:
         _err(f"CAD Viewer could not start in the background: {error}\n")
@@ -622,7 +624,7 @@ def serve(argv: list[str], *, prog: str = DEFAULT_PROG) -> int:
     host, port = args["host"], args["port"]
 
     # --api-only exempts the check because in dev the CLIENT COMES FROM VITE:
-    # this process serves only /__cad and /__tess_cache, and requiring a built
+    # this process serves only /__cad, and requiring a built
     # dist made `npm run dev` fail on any checkout that had not run
     # `npm run build` first — dist/ is gitignored, so that is every fresh
     # clone. The dist routes still answer 404 in that mode, which is what they
@@ -746,13 +748,6 @@ def serve(argv: list[str], *, prog: str = DEFAULT_PROG) -> int:
     say(f"CAD Viewer URL: {url}\n")
     if args["json"]:
         _out(f"{_compact_json({'url': url, 'port': port, 'action': 'started'})}\n")
-
-    # Start the build daemon, whose workers import build123d while nobody waits: the
-    # session's first build, or the viewer's first STEP import, otherwise pays for it.
-    # After the announcement, never before it: the URL line is the readiness signal
-    # and waits for nothing. The viewer never builds anything itself; this only warms
-    # what will.
-    threading.Thread(target=_prewarm_daemon, name="cadgen-viewer-prewarm", daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)

@@ -85,7 +85,7 @@ class Dispatch(unittest.TestCase):
         original = cli.importlib.import_module
         cli.importlib.import_module = lambda name: FakeModule
         self.addCleanup(setattr, cli.importlib, "import_module", original)
-        code, _, _ = self._run(["snapshot", "--port", "3245", "--", "-x"])
+        code, _, _ = self._run(["doctor", "--port", "3245", "--", "-x"])
         self.assertEqual(code, 7)
         self.assertEqual(seen["argv"], ["--port", "3245", "--", "-x"])
 

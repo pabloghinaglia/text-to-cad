@@ -161,7 +161,9 @@ reference host `basic-host` does.
   that sends each request as a `cad_http` tool call against the placeholder
   origin `http://cad.invalid`; the server hands it to the viewer's own router,
   over its own model library and analytics. Everything the page asks of the
-  server travels this way, as the web page asks its own: the models, the
+  server travels this way, as the web page asks its own: the models -- a STEP's
+  and an `.xbf`'s reads too, which the viewer's router relays to the cadgen engine
+  that serves them (`/__cad/xbf/api/...`), never a port of the engine's own -- the
   library and its pictures, Open (`/__cad/pick`), Reveal, the person's analytics
   answer and features, the update check. Only the clipboard stays the host's: a
   view copies through its frame. So the page has three tools of its own:
@@ -174,12 +176,10 @@ reference host `basic-host` does.
   TypeScript SDK's stdio reader caps it at 10 MiB unless a host sets more
   (Claude Code 16 MiB, Claude Desktop 32 MiB). So no `cad_http` reply carries
   more than 4 MiB of body (`TUNNEL_REPLY_MAX_BYTES`), a message under 5.6 MB,
-  for any model: the client asks for batched reads of at most that (the web
-  client asks for 32 MiB), every GET asks for its first 4 MiB as a byte range,
+  for any model: every GET asks for its first 4 MiB as a byte range,
   and a longer body comes back a range at a time, which the tunnel puts together
   for the client. A part of a body that changed meanwhile (its `etag`) fails the
-  read, and the cache verifies a tessellation's digest of the whole as of
-  any body. The server refuses any reply still longer (502), and an agent's
+  read. The server refuses any reply still longer (502), and an agent's
   screenshot longer than that, rather than send it. 4 MiB loads as fast as 8 MiB
   did. The server produces such a body once: each later part names it
   (`if-range: <etag>`) and is cut from the body the first part kept, never by
@@ -200,13 +200,13 @@ reference host `basic-host` does.
   and pick of the others behind it. So a view syncs (`cad_sync`, `host/sync.ts`),
   answered at once, about once a second (`views.POLL_SECONDS`). Up go what it
   shows — its model, its state whenever that changed (what `cad_view` reads),
-  that a person just touched it — and what it watches: its file's catalog entry
-  and the build feed of a model being edited. Back come the agent's requests for it
-  (`show`, `capture`), the catalog's revision, which the view reads again only
-  when it moved, and each feed's status (whether a build is running or failed:
-  the view shows the saved file), handed to the client as its
-  `editingPreviewFeed`. A sync that brought news (an event, a moving build) is
-  followed by the next sooner.
+  that a person just touched it — and what it watches: its file's catalog entry.
+  Back come the agent's requests for it
+  (`show`, `capture`), and the catalog's revision, which the view reads again only
+  when it moved. A sync that brought news (an event) is followed by the next sooner.
+  A STEP or an `.xbf` the view shows asks the engine for its next version about once a
+  second, answered at once (`cadgen/mcp/tunnel.py`), and a document the engine is still
+  reading answers `202` until it holds it: neither holds a call.
 
 - **A capture is of the model asked about, once it is drawn.** An agent captures
   right after it opened a view, showed a model or rebuilt one, so `cad_screenshot`
@@ -226,7 +226,7 @@ reference host `basic-host` does.
 | `server.ts` | typed calls to the page's three tools: its sync, its answer to a capture, and `cad_http` |
 | `tunnel.ts` | the `fetch` over `cad_http`, a long body a range at a time, and the CAD client over it (`App.tsx` makes one per view): the library, Open, Reveal and the person's settings among its requests |
 | `prompt.ts` | Quick Edit's chat: `chatReach`, what the host's chat takes, and the prompt port over it — Queue through `ui/update-model-context` (a text block titled `Quick edit · <file>` naming the snapshot path, kept until the host clears its model context), Send through `ui/message` — with references as absolute paths (Copy Prompt spells them as copied references are) |
-| `live.ts`, `sync.ts` | the mounted view's live controller (`@text-to-cad/ui/host`'s registry), and its sync (`cad_sync`), every second: its state for the agent, the agent's requests (`show`, `capture`), the catalog's revision and its build feeds |
+| `live.ts`, `sync.ts` | the mounted view's live controller (`@text-to-cad/ui/host`'s registry), and its sync (`cad_sync`), every second: its state for the agent, the agent's requests (`show`, `capture`) and the catalog's revision |
 | `presentation.ts` | how the host presents the page, and the election that retires older inline views |
 | `clipboard.ts` | the frame's clipboard, every copy's: the asynchronous clipboard where the host grants it (the resource asks for `clipboardWrite`), else the page's own copy command, still inside the press, for text |
 
